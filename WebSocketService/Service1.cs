@@ -1,128 +1,246 @@
 ﻿using System;
-using System.Diagnostics;
+using System.IO.Ports;
+using System.Net;
 using System.ServiceProcess;
-using System.Threading;
-using Newtonsoft.Json;
+using System.Text;
+using System.Threading.Tasks;
+using System.Diagnostics;
+using System.IO;
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
 
 namespace WebSocketService
 {
     public partial class Service1 : ServiceBase
     {
-        private readonly string serverAddress = "wss://eye.xxisxx.net:1030/?user=dq&pc=1"; // 修改为实际的 WebSocket 服务器地址
-        private WebSocket4Net.WebSocket websocket;
-        private bool isWebSocketConnected = false;
-
-        // 事件日志对象
         private EventLog eventLog;
+        private SerialPort serialPort;
+        private static string url;
+        private static string USB_COM;
+        private static int USB_BR;
+        private static int MAX_TEMPERATURE;
+        private static int MAX_SPEED;
+        private System.Timers.Timer reconnectTimer;
+        private string statusTxt;
 
         public Service1()
         {
             InitializeComponent();
-            // 设置事件日志
             eventLog = new EventLog();
-            if (!EventLog.SourceExists("WebSocketServiceSource"))
+            if (!EventLog.SourceExists("DengqianServiceSource"))
             {
-                EventLog.CreateEventSource("WebSocketServiceSource", "WebSocketServiceLog");
+                EventLog.CreateEventSource("DengqianServiceSource", "DengqianServiceLog");
             }
-            eventLog.Source = "WebSocketServiceSource";
-            eventLog.Log = "WebSocketServiceLog";
+            eventLog.Source = "DengqianServiceSource";
+            eventLog.Log = "DengqianServiceLog";
+
+            reconnectTimer = new System.Timers.Timer(2000);
+            reconnectTimer.Elapsed += (sender, e) => InitSerialPort();
+
+            LoadConfig();
         }
 
         protected override void OnStart(string[] args)
         {
-            StartWebSocket();
-            StartPerformanceMonitoring();
+            WriteLogEntry("服务启动中...", EventLogEntryType.Information);
+            InitSerialPort();
+            GetData();
         }
 
         protected override void OnStop()
         {
-            StopPerformanceMonitoring();
-            StopWebSocket();
+            WriteLogEntry("服务停止中...", EventLogEntryType.Information);
+            serialPort?.Close();
+            reconnectTimer?.Stop();
         }
 
-        private void StartWebSocket()
+        private void LoadConfig()
         {
-            websocket = new WebSocket4Net.WebSocket(serverAddress,SslConfiguration.Default);
-
-            websocket.Opened += (sender, e) =>
+            try
             {
-                isWebSocketConnected = true;
-                // 写入连接状态到事件日志
-                WriteLogEntry("WebSocket connected", EventLogEntryType.Information);
-            };
+                string configFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
+                var config = new Dictionary<string, string>();
 
-            websocket.Closed += (sender, e) =>
-            {
-                isWebSocketConnected = false;
-                // 写入连接状态到事件日志
-                WriteLogEntry("WebSocket disconnected 断开连接 也许是无法连接到服务器", EventLogEntryType.Warning);
-                // 断开后尝试重新连接
-                Thread.Sleep(5000); // 等待5秒后重新连接
-                StartWebSocket();
-            };
-
-            websocket.Open();
-        }
-
-        private void StopWebSocket()
-        {
-            if (websocket != null && websocket.State == WebSocket4Net.WebSocketState.Open)
-            {
-                websocket.Close();
-            }
-        }
-
-        private void StartPerformanceMonitoring()
-        {
-            Timer timer = new Timer(UpdatePerformanceData, null, TimeSpan.Zero, TimeSpan.FromSeconds(5)); // 每5秒更新一次性能数据
-        }
-
-        private void StopPerformanceMonitoring()
-        {
-            // 在此停止性能监控的逻辑，如果有的话
-        }
-
-        private void UpdatePerformanceData(object state)
-        {
-            PerformanceCounter cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-            PerformanceCounter ramCounter = new PerformanceCounter("Memory", "Available MBytes");
-
-            float cpuUsage = cpuCounter.NextValue();
-            float ramUsage = ramCounter.NextValue();
-
-            // 获取机器码、处理器数量和操作系统版本
-            string machineName = Environment.MachineName;
-            int processorCount = Environment.ProcessorCount;
-            Version osVersion = Environment.OSVersion.Version;
-
-            // 构造要发送的 JSON 数据
-            var data = new
-            {
-                main = 201,
-                type = 0,
-                body = JsonConvert.SerializeObject(new
+                foreach (var line in File.ReadAllLines(configFilePath))
                 {
-                    machineName,
-                    processorCount,
-                    osVersion,
-                    cpu = cpuUsage,
-                    ram = ramUsage
-                    // 如果还需要其他性能数据，可以继续添加在这里
-                })
-            };
+                    if (line.Contains("="))
+                    {
+                        var keyValue = line.Split(new[] { '=' }, 2);
+                        if (keyValue.Length == 2)
+                        {
+                            config[keyValue[0].Trim()] = keyValue[1].Trim();
+                        }
+                    }
+                }
 
-            string jsonData = JsonConvert.SerializeObject(data);
+                url = config["url"];
+                USB_COM = config["USB_COM"];
+                USB_BR = int.Parse(config["USB_BR"]);
+                MAX_TEMPERATURE = int.Parse(config["MAX_TEMPERATURE"]);
+                MAX_SPEED = int.Parse(config["MAX_SPEED"]);
 
-            // 发送数据到 WebSocket 服务器
-            if (isWebSocketConnected)
-            {
-                websocket.Send(jsonData);
+                WriteLogEntry("配置文件加载成功。", EventLogEntryType.Information);
             }
-            else
+            catch (Exception ex)
             {
-                // 写入错误信息到事件日志
-                WriteLogEntry("WebSocket is not connected. Unable to send data.", EventLogEntryType.Error);
+                WriteLogEntry($"加载配置文件时出错: {ex.Message}", EventLogEntryType.Error);
+                throw;
             }
+        }
+
+        private void InitSerialPort()
+        {
+            try
+            {
+                serialPort = new SerialPort(USB_COM, USB_BR);
+                serialPort.Open();
+                serialPort.DataReceived += SerialPort_DataReceived;
+                serialPort.ErrorReceived += SerialPort_ErrorReceived;
+                statusTxt = $"串口 {USB_COM} 已连接.";
+                WriteLogEntry(statusTxt, EventLogEntryType.Information);
+            }
+            catch (Exception ex)
+            {
+                statusTxt = $"串口 {USB_COM} 不存在或未连接: {ex.Message}";
+                WriteLogEntry(statusTxt, EventLogEntryType.Error);
+                reconnectTimer.Start();
+            }
+        }
+
+        private void SerialPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            var data = serialPort.ReadExisting();
+            //WriteLogEntry($"串口数据: {data}", EventLogEntryType.Information);
+        }
+
+        private void SerialPort_ErrorReceived(object sender, SerialErrorReceivedEventArgs e)
+        {
+            statusTxt = "串口错误";
+            WriteLogEntry(statusTxt, EventLogEntryType.Error);
+            reconnectTimer.Start();
+        }
+
+        private async void GetData()
+        {
+            while (true)
+            {
+                try
+                {
+                    WriteLogEntry($"发送HTTP请求到 {url}", EventLogEntryType.Information);
+                    var request = WebRequest.Create(url);
+                    request.Method = "GET";
+                    request.ContentType = "text/event-stream";
+
+                    using (var response = await request.GetResponseAsync())
+                    using (var stream = response.GetResponseStream())
+                    using (var reader = new StreamReader(stream, Encoding.UTF8))
+                    {
+                        var buffer = new StringBuilder();
+                        string line;
+                        while ((line = await reader.ReadLineAsync()) != null)
+                        {
+                            if (line.StartsWith("data: "))
+                            {
+                                buffer.AppendLine(line.Substring(5).Trim()); // 去掉 "data: " 前缀
+                            }
+                            else if (string.IsNullOrWhiteSpace(line) && buffer.Length > 0)
+                            {
+                                // 分隔符，处理完整的消息
+                                var message = buffer.ToString();
+                                buffer.Clear();
+
+                              //  WriteLogEntry($"收到数据: {message}", EventLogEntryType.Information);
+
+                                // 处理消息
+                                var dataEntries = message.Split(new[] { "{|}" }, StringSplitOptions.None);
+                                var txtlist = new StringBuilder();
+
+                                foreach (var entry in dataEntries)
+                                {
+                                    var kvp = entry.Split('|');
+                                    if (kvp.Length == 2)
+                                    {
+                                        var key = kvp[0];
+                                        var value = kvp[1];
+                                        if (double.TryParse(Regex.Match(value, @"[\d.]+").Value, out var numericValue))
+                                        {
+                                            var percentageValue = ConvertToPercentage(key, numericValue);
+                                            txtlist.Append($"{percentageValue}|");
+                                        }
+                                    }
+                                }
+
+                                if (txtlist.Length > 0 && txtlist[txtlist.Length - 1] == '|')
+                                {
+                                    txtlist.Length--;
+                                }
+
+                                if (serialPort.IsOpen)
+                                {
+                                    serialPort.Write(txtlist.ToString());
+                                  //  WriteLogEntry($"发送数据: {txtlist}", EventLogEntryType.Information);
+                                }
+                                else
+                                {
+                                    WriteLogEntry("串口未打开，无法发送数据", EventLogEntryType.Warning);
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (WebException webEx)
+                {
+                    WriteLogEntry($"HTTP请求错误: {webEx.Message}", EventLogEntryType.Error);
+
+                    if (webEx.Response != null)
+                    {
+                        using (var errorResponse = (HttpWebResponse)webEx.Response)
+                        using (var reader = new StreamReader(errorResponse.GetResponseStream()))
+                        {
+                            string errorText = reader.ReadToEnd();
+                            WriteLogEntry($"服务器响应: {errorText}", EventLogEntryType.Error);
+                        }
+                    }
+
+                    await Task.Delay(2000);
+                }
+                catch (Exception ex)
+                {
+                    WriteLogEntry($"请求错误: {ex.Message}", EventLogEntryType.Error);
+
+                    if (ex.InnerException != null)
+                    {
+                        WriteLogEntry($"请求内部错误: {ex.InnerException.Message}", EventLogEntryType.Error);
+                    }
+
+                    await Task.Delay(2000);
+                }
+            }
+        }
+
+
+        private double ConvertToPercentage(string key, double value)
+        {
+            double percentage = 0;
+
+            if (key.Contains("Simple1") || key.Contains("Simple3") || key.Contains("Simple5"))
+            {
+                percentage = value / 100;
+            }
+            else if (key.Contains("Simple2") || key.Contains("Simple4") || key.Contains("Simple6"))
+            {
+                percentage = value / MAX_TEMPERATURE;
+            }
+            else if (key.Contains("Simple7") || key.Contains("Simple8"))
+            {
+                percentage = Math.Min(value / MAX_SPEED, 1);
+            }
+            else if (key.Contains("Simple9") || key.Contains("Simple10"))
+            {
+                percentage = Math.Min(value / (MAX_SPEED * 0.1), 1);
+            }
+
+            return Math.Round(percentage * 100) / 100;
         }
 
         private void WriteLogEntry(string message, EventLogEntryType entryType)
